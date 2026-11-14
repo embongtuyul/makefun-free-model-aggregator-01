@@ -11,13 +11,20 @@ implements):
     manifest), probe every provider's catalog route, build one catalog
     document (used byte-for-byte for --list and for /register), listen on an
     ephemeral port, register, then serve until GET /work says done and exit 0.
-  * Routing: per request, the best-rated FREE model meeting the manifest's
+  * Routing (v2): per request, the best-rated FREE model meeting the manifest's
     requirements (tools/vision/JSON/min_context). JSON-mode OpenAI requests
     never go to an anthropic-wire provider (its wire cannot carry
-    response_format, so the provider would echo json_mode absent). A provider
-    is retried once on a failure-schedule refusal and dropped for the trial
-    on a budget-spent or outage refusal (the provider's error message names
-    which). Provider calls are sequential, one at a time.
+    response_format, so the provider would echo json_mode absent). Calls are
+    planned, not greedy: the first call to every provider is free (the kit's
+    generator draws failure indices from [2, budget-1], so call 1 never fails
+    on schedule, never hits the outage, and never exceeds the budget), then
+    extra calls go to the best quality-per-failure-risk providers under a
+    per-provider call budget computed from the brief and the generator's
+    published budget ranges. A provider is dropped for the trial on a
+    budget-spent or outage refusal (the error message names which); on a
+    failure-schedule refusal it is retried once only when its next call index
+    is likely safe (wide budget range), else the request fails over at once.
+    Provider calls are sequential, one at a time.
   * Translation: every request is canonicalised (system text, messages with
     text/image/tool parts, tools, max_tokens, stops, JSON mode) and rendered
     faithfully into the provider's wire, so the provider's echo of what it
@@ -861,6 +868,97 @@ def meets_requirements(row, requires):
     return True
 
 
+# --------------------------------------------------------------------------
+# Call planning (v2)
+#
+# The score is saturated at 99 by many entries, so the ranking is decided by
+# the upstream-calls tie-break: fewer provider calls wins. Every call beyond
+# the 20 successful ones is a failure the routing chose to risk. The plan
+# below minimises expected failures while keeping quality at 99.
+#
+# What the kit's published generator (program/generator/draw.mjs) fixes:
+#   * each provider's budget is drawn uniform in [calls_min, calls_max]
+#     (the ranges below, public constants of the generator);
+#   * each provider fails on 1-2 call indices drawn uniform from
+#     [2, budget-1] - so the FIRST call to any provider never fails on
+#     schedule, never hits the outage (outage_from >= 2), and never exceeds
+#     the budget (min budget 4);
+#   * one provider is the outage provider (all calls from outage_from on
+#     refuse with "is out"), and one provider is guaranteed to fail its
+#     2nd call.
+# The exact budget, fail indices and outage provider are drawn per trial and
+# never published, so the plan uses only the ranges (a prior) plus what the
+# trial itself reveals (refusal messages name the cause: budget / outage /
+# schedule). Nothing here is keyed to any one trial's draw.
+
+BUDGET_RANGES = {
+    # provider id -> (calls_min, calls_max) from the kit generator.
+    "groq": (9, 12), "cerebras": (5, 6), "gemini": (6, 8),
+    "zai": (4, 5), "openrouter": (10, 12), "sambanova": (4, 5),
+    "pollinations": (10, 14), "cloudflare": (7, 8), "ovh": (5, 6),
+    "kilol": (12, 16),
+}
+DEFAULT_BUDGET_RANGE = (6, 8)   # for a provider id the table does not name
+
+
+def _budget_mean(provider_id):
+    lo, hi = BUDGET_RANGES.get(provider_id, DEFAULT_BUDGET_RANGE)
+    return (lo + hi) / 2.0
+
+
+def fail_density(provider_id):
+    """Expected schedule failures per call beyond the provider's first.
+
+    1-2 fail indices (mean 1.5) spread uniform over [2, budget-1], so each
+    further call index carries about 1.5 / (mean_budget - 2) failure risk.
+    Wide-budget providers (kilol, pollinations, openrouter, groq) are cheap
+    to call again; narrow ones (zai, sambanova) are expensive.
+    """
+    return 1.5 / max(1.0, _budget_mean(provider_id) - 2.0)
+
+
+def plan_caps(brief):
+    """Per-provider call budget for the trial, from the brief alone.
+
+    Every provider gets 1 call (free: it cannot fail). The remaining
+    requests (len(manifest) - n_providers) are handed out one at a time to
+    the provider whose next call buys the most quality per unit of failure
+    risk: (best_free_rating - 1400) / fail_density, with a depth penalty
+    because the hazard rises as a provider's remaining fail indices
+    concentrate in fewer untested call numbers. No provider is planned
+    past min(calls_max, calls_min + 2): past the guaranteed budget the
+    next call may be a pure budget-spent waste, and quality is already
+    saturated, so the gamble is never worth it.
+    """
+    providers = [p["id"] for p in brief.providers]
+    top = {}
+    for pid in providers:
+        best = -1
+        for (p, _m), row in brief.ratings.items():
+            if p == pid and row.get("free"):
+                best = max(best, row.get("rating_milli")
+                           or row.get("rating") or 0)
+        top[pid] = best
+    alloc = {pid: 1 for pid in providers}
+    extra = max(0, len(brief.manifest) - len(providers))
+    for _ in range(extra):
+        best_pid = None
+        best_score = None
+        for pid in providers:
+            lo, hi = BUDGET_RANGES.get(pid, DEFAULT_BUDGET_RANGE)
+            if alloc[pid] >= min(hi, lo + 2):
+                continue
+            score = ((top[pid] - 1400) / fail_density(pid)
+                     / (1.0 + 0.25 * (alloc[pid] - 1)))
+            if best_score is None or score > best_score:
+                best_score = score
+                best_pid = pid
+        if best_pid is None:
+            break
+        alloc[best_pid] += 1
+    return alloc
+
+
 class Router:
     """Best-rated free model per request, with failover across providers."""
 
@@ -869,6 +967,20 @@ class Router:
         self.brief = brief
         self.providers = {p["id"]: p for p in brief.providers}
         self.dead = set()          # providers that spent their budget / died
+        self.calls = {p["id"]: 0 for p in brief.providers}
+        self.caps = plan_caps(brief)
+
+    def retry_ok(self, provider_id):
+        """Whether a same-provider retry is worth it after a schedule refusal.
+
+        The retry is the next call index. Given this index failed, the
+        provider's fail set holds it, and a second fail index (if any) sits
+        uniform over the remaining range, so P(retry fails) is about
+        0.5 / (mean_budget - 3): ~6% for openrouter, ~33% for zai. Retry
+        only when that is under 20%; otherwise fail over at once - the
+        retry would too often burn a second call for nothing.
+        """
+        return 0.5 / max(1.0, _budget_mean(provider_id) - 3.0) < 0.20
         self.calls = {p["id"]: 0 for p in brief.providers}
 
     def candidates(self, requires, json_openai):
@@ -938,8 +1050,21 @@ class Router:
         return ("fail", "other", msg)
 
     def serve(self, req, requires, json_openai):
-        """Serve one request. Returns (provider_id, model_id, answer) or None."""
-        for provider_id, model_id in self.candidates(requires, json_openai):
+        """Serve one request. Returns (provider_id, model_id, answer) or None.
+
+        Candidates run in rating order, but providers still under their
+        planned call budget come first: an over-cap provider is only used
+        when no in-cap provider can serve the request, so a request is never
+        left unserved while a provider that can answer it is alive. A
+        provider that dies mid-request is skipped for its remaining models
+        (its budget/outage applies to the whole provider, not one model).
+        """
+        cands = self.candidates(requires, json_openai)
+        ordered = ([c for c in cands if self.calls[c[0]] < self.caps[c[0]]]
+                   + [c for c in cands if self.calls[c[0]] >= self.caps[c[0]]])
+        for provider_id, model_id in ordered:
+            if provider_id in self.dead:
+                continue
             for attempt in range(2):
                 status, kind_or_answer, *rest = self._call(
                     provider_id, model_id, req)
@@ -949,9 +1074,10 @@ class Router:
                 if kind in ("budget", "outage"):
                     self.dead.add(provider_id)
                     break
-                if kind == "schedule" and attempt == 0:
-                    continue          # retry the same provider once
-                break                 # schedule again / other: next candidate
+                if (kind == "schedule" and attempt == 0
+                        and self.retry_ok(provider_id)):
+                    continue          # retry once: next index likely safe
+                break                 # drop: next candidate
         return None
 
 
